@@ -17,11 +17,20 @@ LABEL org.opencontainers.image.title="Aeon build base" \
       org.opencontainers.image.source="https://github.com/Dwizzle2009/aeon-buildbase"
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# One package per line so a renamed package names itself in the build log. libvulkan-dev carries the headers on Debian.
+RUN apt-get update && for p in \
       build-essential gcc g++ cmake ninja-build make pkg-config git ca-certificates \
       python3 zip unzip xz-utils file binutils \
       libsdl2-dev libsdl2-mixer-dev \
-      libvulkan-dev vulkan-headers glslang-tools glslc spirv-tools \
+      libvulkan-dev glslang-tools glslc spirv-tools \
+      libcurl4-openssl-dev libssl-dev \
+      libwayland-dev wayland-protocols libxkbcommon-dev; do \
+      apt-cache show "$p" >/dev/null 2>&1 || { echo "no such package in this Debian: $p" >&2; exit 1; }; done \
+    && apt-get install -y --no-install-recommends \
+      build-essential gcc g++ cmake ninja-build make pkg-config git ca-certificates \
+      python3 zip unzip xz-utils file binutils \
+      libsdl2-dev libsdl2-mixer-dev \
+      libvulkan-dev glslang-tools glslc spirv-tools \
       libcurl4-openssl-dev libssl-dev \
       libwayland-dev wayland-protocols libxkbcommon-dev \
     && rm -rf /var/lib/apt/lists/*
