@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""aeon-pack -- package, validate, build and publish games for Aeon.
+
+  aeon-pack init     <game-dir>                         write a template aeon.json
+  aeon-pack validate <game-dir>                         check the manifest and the build
+  aeon-pack build    <game-dir> [--out DIR]             -> DIR/<SKU>/<sku>-<ver>.tar.gz + manifest.json
+  aeon-pack publish  <out-dir>/<SKU> [--local] [--r2]   sign (Aeon only) and register; --local for the dev CDN
+
+Studios run init / validate / build. Aeon runs publish: the signing key never leaves Aeon.
+Spec: docs/PACKAGE.md. Manifest version 2; version-1 manifests remain installable.
+"""
+import argparse, base64, hashlib, json, os, re, subprocess, sys, tarfile, time
+
+PLATFORMS = {"linux-x86_64", "windows-x86_64"}
+RUNTIMES = {"native", "proton"}
+SKU_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{2,63}$")
+VER_RE = re.compile(r"^\d+\.\d+(\.\d+)?([-+][0-9A-Za-z.-]+)?$")
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr); sys.exit(code)
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""): h.update(chunk)
+    return h.hexdigest()
+
+TEMPLATE = {
+    "aeon_manifest": 2,
+    "sku": "MY-GAME-STD",
+    "title": "My Game",
+    "version": "1.0.0",
+    "developer": "My Studio",
+    "platform": "linux-x86_64",
+    "runtime": {"type": "native"},
+    "exec": "MyGame.x86_64",
+    "args": [],
+    "env": {},
+    "workdir": ".",
+    "saves": ["~/.local/share/MyGame"],
+    "requires": {"disk_mb": 0},
+    "content": [{"id": "base"}],
+}
+
+def load_manifest(game_dir):
+    p = os.path.join(game_dir, "aeon.json")
+    if not os.path.isfile(p): die(f"no aeon.json in {game_dir} (run: aeon-pack init {game_dir})")
+    try:
+        return json.load(open(p))
+    except json.JSONDecodeError as e:
+        die(f"aeon.json is not valid JSON: {e}")
+
+
+# ---- achievements.json / leaderboards.json: definitions live next to aeon.json and ship with the build.
+DEF_KEY = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+DEF_FILES = ("achievements.json", "leaderboards.json")
+
+def load_defs(game_dir, name):
+    p = os.path.join(game_dir, name)
+    if not os.path.isfile(p): return None
+    try: d = json.load(open(p))
+    except Exception as e: die(f"{name}: not valid JSON ({e})")
+    if not isinstance(d, list): die(f"{name}: must be a JSON array")
+    return d
+
+def validate_defs(game_dir):
+    """Same rules the API enforces (PUT /admin|/studio/dev ... /achievements, /leaderboards)."""
+    errs = []
+    ach = load_defs(game_dir, "achievements.json")
+    if ach is not None:
+        if len(ach) > 200: errs.append("achievements.json: more than 200 achievements")
+        seen = set()
+        for i, a in enumerate(ach):
+            k = a.get("key") if isinstance(a, dict) else None
+            if not isinstance(k, str) or not DEF_KEY.match(k): errs.append(f"achievements.json[{i}]: key must be lowercase [a-z0-9_], 1-64 chars"); continue
+            if k in seen: errs.append(f"achievements.json: duplicate key '{k}'")
+            seen.add(k)
+            if not 1 <= len(str(a.get("name", "")).strip()) <= 80: errs.append(f"achievement '{k}': name must be 1-80 chars")
+            if len(str(a.get("description", ""))) > 400: errs.append(f"achievement '{k}': description over 400 chars")
+            pts = a.get("points", 0)
+            if not isinstance(pts, int) or isinstance(pts, bool) or not 0 <= pts <= 1000: errs.append(f"achievement '{k}': points must be an integer 0-1000")
+            mp = a.get("max_progress")
+            if mp is not None and (not isinstance(mp, int) or not 1 <= mp <= 1000000): errs.append(f"achievement '{k}': max_progress must be an integer 1-1000000")
+            if "hidden" in a and not isinstance(a["hidden"], bool): errs.append(f"achievement '{k}': hidden must be true/false")
+    lb = load_defs(game_dir, "leaderboards.json")
+    if lb is not None:
+        if len(lb) > 50: errs.append("leaderboards.json: more than 50 leaderboards")
+        seen = set()
+        for i, b in enumerate(lb):
+            c = b.get("category") if isinstance(b, dict) else None
+            if not isinstance(c, str) or not DEF_KEY.match(c): errs.append(f"leaderboards.json[{i}]: category must be lowercase [a-z0-9_], 1-64 chars"); continue
+            if c in seen: errs.append(f"leaderboards.json: duplicate category '{c}'")
+            seen.add(c)
+            if not 1 <= len(str(b.get("name", "")).strip()) <= 80: errs.append(f"leaderboard '{c}': name must be 1-80 chars")
+            if b.get("sort", "desc") not in ("asc", "desc"): errs.append(f"leaderboard '{c}': sort must be \"asc\" (lower is better) or \"desc\"")
+            if b.get("format", "number") not in ("number", "time_ms", "distance_m"): errs.append(f"leaderboard '{c}': format must be number, time_ms or distance_m")
+    if not errs and (ach is not None or lb is not None):
+        print(f"[defs] {len(ach or [])} achievement(s), {len(lb or [])} leaderboard(s)")
+    return errs
+
+def validate(game_dir, m, strict=True):
+    errs, warns = [], []
+    errs += validate_defs(game_dir)
+    def need(k, t=None):
+        if k not in m: errs.append(f"missing required field '{k}'"); return None
+        if t and not isinstance(m[k], t): errs.append(f"'{k}' must be {t.__name__}"); return None
+        return m[k]
+    if m.get("aeon_manifest") != 2: errs.append("'aeon_manifest' must be 2")
+    sku = need("sku", str)
+    if sku and not SKU_RE.match(sku): errs.append("'sku' must be UPPERCASE letters, digits and dashes, e.g. MY-GAME-STD")
+    need("title", str); need("developer", str)
+    ver = need("version", str)
+    if ver and not VER_RE.match(ver): errs.append("'version' must look like 1.2.3")
+    plat = need("platform", str)
+    if plat and plat not in PLATFORMS: errs.append(f"'platform' must be one of {sorted(PLATFORMS)}")
+    rt = need("runtime", dict) or {}
+    rtt = rt.get("type")
+    if rtt not in RUNTIMES: errs.append(f"'runtime.type' must be one of {sorted(RUNTIMES)}")
+    if plat == "windows-x86_64" and rtt != "proton": errs.append("windows-x86_64 builds must use runtime.type 'proton'")
+    if plat == "linux-x86_64" and rtt != "native": errs.append("linux-x86_64 builds must use runtime.type 'native'")
+    if rtt == "proton" and "version" in rt and not isinstance(rt["version"], str): errs.append("'runtime.version' must be a string (a Proton build name, or 'default')")
+    workdir = m.get("workdir", ".")
+    if not isinstance(workdir, str) or workdir.startswith("/") or ".." in workdir.split("/"): errs.append("'workdir' must be a relative path inside the build")
+    ex = need("exec", str)
+    if ex:
+        if ex.startswith("/") or ".." in ex.split("/"): errs.append("'exec' must be a relative path inside the build")
+        else:
+            full = os.path.join(game_dir, workdir, ex)
+            if not os.path.isfile(full): errs.append(f"'exec' not found: {os.path.normpath(os.path.join(workdir, ex))}")
+            elif rtt == "native" and not os.access(full, os.X_OK): errs.append(f"'exec' is not executable: {ex} (chmod +x)")
+            elif rtt == "proton" and not ex.lower().endswith((".exe", ".bat")): warns.append("'exec' for a proton build is usually an .exe")
+    for k in ("args",):
+        if k in m and (not isinstance(m[k], list) or not all(isinstance(a, str) for a in m[k])): errs.append(f"'{k}' must be a list of strings")
+    if "env" in m and (not isinstance(m["env"], dict) or not all(isinstance(v, str) for v in m["env"].values())): errs.append("'env' must be an object of string values")
+    saves = m.get("saves", [])
+    if not isinstance(saves, list) or not all(isinstance(s_, str) for s_ in saves): errs.append("'saves' must be a list of paths")
+    elif not saves: warns.append("'saves' is empty -- cloud saves will not sync this title")
+    content = m.get("content", [{"id": "base"}])
+    if not isinstance(content, list) or not content: errs.append("'content' must be a non-empty list")
+    else:
+        ids = [c.get("id") for c in content]
+        if ids[0] != "base": errs.append("the first 'content' entry must have id 'base'")
+        if len(set(ids)) != len(ids): errs.append("'content' ids must be unique")
+        for c in content[1:]:
+            if not c.get("sku"): errs.append(f"content '{c.get('id')}' needs a 'sku' (DLC is gated by its own entitlement)")
+            if not c.get("dir"): errs.append(f"content '{c.get('id')}' needs a 'dir' (its files, relative to the build root)")
+            elif not os.path.isdir(os.path.join(game_dir, c["dir"])): errs.append(f"content '{c.get('id')}' dir not found: {c['dir']}")
+    if os.path.isdir(os.path.join(game_dir, ".git")): warns.append("a .git directory is inside the build and will be packaged")
+    for w in warns: print(f"warning: {w}")
+    for e in errs: print(f"error: {e}", file=sys.stderr)
+    if errs and strict: sys.exit(2)
+    return not errs
+
+def file_list(root, exclude_dirs=()):
+    out = []
+    for dp, dn, fn in os.walk(root):
+        rel_dp = os.path.relpath(dp, root)
+        if any(rel_dp == ed or rel_dp.startswith(ed + os.sep) for ed in exclude_dirs): dn[:] = []; continue
+        for f in fn:
+            p = os.path.join(dp, f); rel = os.path.normpath(os.path.join(rel_dp, f)) if rel_dp != "." else f
+            if rel == "aeon.json": continue
+            out.append({"path": rel, "sha256": sha256_file(p), "size": os.path.getsize(p)})
+    out.sort(key=lambda e: e["path"]); return out
+
+def build(game_dir, out_root):
+    m = load_manifest(game_dir); validate(game_dir, m)
+    sku, ver = m["sku"], m["version"]
+    out = os.path.join(out_root, sku); os.makedirs(out, exist_ok=True)
+    content = m.get("content", [{"id": "base"}])
+    dlc_dirs = tuple(c["dir"] for c in content[1:])
+    # base payload: everything except DLC dirs
+    base_name = f"{sku.lower()}-{ver}.tar.gz"; base_path = os.path.join(out, base_name)
+    with tarfile.open(base_path, "w:gz") as tf:
+        for e in file_list(game_dir, dlc_dirs): tf.add(os.path.join(game_dir, e["path"]), arcname=e["path"])
+        tf.add(os.path.join(game_dir, "aeon.json"), arcname="aeon.json")
+    reg = dict(m); reg["built"] = int(time.time())
+    reg["content"] = [{"id": "base", "payload": base_name, "sha256": sha256_file(base_path), "size": os.path.getsize(base_path)}]
+    reg["files"] = file_list(game_dir, dlc_dirs)
+    for c in content[1:]:   # each DLC pack is its own payload, gated by its own SKU
+        name = f"{c['sku'].lower()}-{ver}.tar.gz"; path = os.path.join(out, name)
+        with tarfile.open(path, "w:gz") as tf: tf.add(os.path.join(game_dir, c["dir"]), arcname=c["dir"])
+        reg["content"].append({"id": c["id"], "sku": c["sku"], "dir": c["dir"], "payload": name, "sha256": sha256_file(path), "size": os.path.getsize(path)})
+    # top-level mirrors for version-1 readers
+    reg["payload"] = base_name; reg["sha256"] = reg["content"][0]["sha256"]; reg["size"] = reg["content"][0]["size"]
+    with open(os.path.join(out, "manifest.json"), "w") as f: json.dump(reg, f, indent=2)
+    for n in DEF_FILES:
+        if os.path.isfile(os.path.join(game_dir, n)):
+            subprocess.run(["cp", os.path.join(game_dir, n), out], check=True); print(f"[build] -> {out}/{n}")
+    print(f"[build] {sku} {ver}: {base_name} ({reg['size']//1024} KB), {len(reg['files'])} files hashed, {len(content)-1} DLC pack(s)")
+    print(f"[build] -> {out}/manifest.json  (unsigned; Aeon signs at publish)")
+    return out
+
+def read_env(path):
+    env = {}
+    if os.path.isfile(path):
+        for line in open(path):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"): k, v = line.split("=", 1); env[k] = v
+    return env
+
+def publish(pkg_dir, local, r2):
+    mf = os.path.join(pkg_dir, "manifest.json")
+    if not os.path.isfile(mf): die(f"no manifest.json in {pkg_dir} (run build first)")
+    m = json.load(open(mf)); sku, ver = m["sku"], m["version"]
+    home = os.path.expanduser("~"); key = os.path.join(home, ".config/aeon/keys/release.key")
+    if not os.path.isfile(key): die(f"no signing key at {key} -- publish is an Aeon step")
+    sig = os.path.join(pkg_dir, "manifest.sig")
+    subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", key, "-rawin", "-in", mf, "-out", sig], check=True)
+    print(f"[sign] {sku} {ver} signed")
+    if local:
+        dst = os.path.join(home, "aeon-cdn", sku); os.makedirs(dst, exist_ok=True)
+        for f in os.listdir(pkg_dir):
+            if f.endswith((".tar.gz", ".json", ".sig")): subprocess.run(["cp", os.path.join(pkg_dir, f), dst], check=True)
+        print(f"[local] -> {dst}  (dev server)")
+    if r2:
+        r2env = read_env(os.path.join(home, ".config/aeon/keys/r2.env")); adm = read_env(os.path.join(home, ".config/aeon/keys/admin.env"))
+        env = dict(os.environ, AWS_CONFIG_FILE="/dev/null", AWS_SHARED_CREDENTIALS_FILE="/dev/null", AWS_DEFAULT_REGION="auto",
+                   AWS_ACCESS_KEY_ID=r2env.get("R2_ACCESS_KEY_ID", ""), AWS_SECRET_ACCESS_KEY=r2env.get("R2_SECRET_ACCESS_KEY", ""),
+                   AWS_REQUEST_CHECKSUM_CALCULATION="when_required", AWS_RESPONSE_CHECKSUM_VALIDATION="when_required")
+        bucket = "aeon-games"
+        for c in m["content"]:
+            key_path = f"games/{sku}/{c['payload']}"
+            subprocess.run(["aws", "s3", "cp", os.path.join(pkg_dir, c["payload"]), f"s3://{bucket}/{key_path}", "--endpoint-url", r2env["R2_ENDPOINT"], "--only-show-errors"], env=env, check=True)
+            print(f"[r2] s3://{bucket}/{key_path}")
+        body = json.dumps({"manifest_text": open(mf).read(), "manifest_sig": base64.b64encode(open(sig, "rb").read()).decode(),
+                           "binary_key": f"games/{sku}/{m['content'][0]['payload']}", "version": ver, "payload_size": m["content"][0]["size"]})
+        import urllib.request
+        req = urllib.request.Request(f"{adm['AEON_API']}/admin/games/{sku}/manifest", data=body.encode(), method="POST",
+                                     headers={"X-Admin-Token": adm["AEON_ADMIN_TOKEN"], "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp: print(f"[api] registered {sku} {ver} -> {resp.status}")
+        except urllib.error.HTTPError as e: die(f"register failed: {e.code} {e.read().decode()[:200]}")
+        for n, path in (("achievements.json", "achievements"), ("leaderboards.json", "leaderboards")):
+            p = os.path.join(pkg_dir, n)
+            if not os.path.isfile(p): continue
+            req = urllib.request.Request(f"{adm['AEON_API']}/admin/games/{sku}/{path}", data=open(p, "rb").read(), method="PUT",
+                                         headers={"X-Admin-Token": adm["AEON_ADMIN_TOKEN"], "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    r = json.load(resp); extra = f"; on server but not in file (kept): {', '.join(r['orphaned'])}" if r.get("orphaned") else ""
+                    print(f"[api] {path}: {r.get(path)} defined{extra}")
+            except urllib.error.HTTPError as e: die(f"{n} rejected: {e.code} {e.read().decode()[:300]}")
+
+def main():
+    ap = argparse.ArgumentParser(prog="aeon-pack", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    a = sp.add_parser("init"); a.add_argument("game_dir")
+    a = sp.add_parser("validate"); a.add_argument("game_dir")
+    a = sp.add_parser("build"); a.add_argument("game_dir"); a.add_argument("--out", default="./aeon-out")
+    a = sp.add_parser("publish"); a.add_argument("pkg_dir"); a.add_argument("--local", action="store_true"); a.add_argument("--r2", action="store_true")
+    args = ap.parse_args()
+    if args.cmd == "init":
+        p = os.path.join(args.game_dir, "aeon.json")
+        if os.path.exists(p): die("aeon.json already exists")
+        os.makedirs(args.game_dir, exist_ok=True); json.dump(TEMPLATE, open(p, "w"), indent=2); print(f"wrote {p} -- edit it, then: aeon-pack validate {args.game_dir}")
+    elif args.cmd == "validate":
+        if validate(args.game_dir, load_manifest(args.game_dir)): print("ok: manifest and build look good")
+    elif args.cmd == "build": build(args.game_dir, args.out)
+    elif args.cmd == "publish":
+        if not (args.local or args.r2): die("publish needs --local (dev server) and/or --r2 (Aeon)")
+        publish(args.pkg_dir, args.local, args.r2)
+
+if __name__ == "__main__": main()
