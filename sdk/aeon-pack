@@ -5,8 +5,9 @@
   aeon-pack validate <game-dir>                         check the manifest and the build
   aeon-pack build    <game-dir> [--out DIR]             -> DIR/<SKU>/<sku>-<ver>.tar.gz + manifest.json
   aeon-pack publish  <out-dir>/<SKU> [--local] [--r2]   sign (Aeon only) and register; --local for the dev CDN
+  aeon-pack install  <game-dir> <user@console> [--clean] put the build on a development console over SSH
 
-Studios run init / validate / build. Aeon runs publish: the signing key never leaves Aeon.
+Studios run init / validate / build / install. Aeon runs publish: the signing key never leaves Aeon.
 Spec: docs/PACKAGE.md. Manifest version 2; version-1 manifests remain installable.
 """
 import argparse, base64, hashlib, json, os, re, subprocess, sys, tarfile, time
@@ -241,6 +242,50 @@ def publish(pkg_dir, local, r2):
                     print(f"[api] {path}: {r.get(path)} defined{extra}")
             except urllib.error.HTTPError as e: die(f"{n} rejected: {e.code} {e.read().decode()[:300]}")
 
+def shq(x):
+    return "'" + str(x).replace("'", "'\\''") + "'"
+
+def exec_line(m, sku):
+    """The shell line the console's launcher runs -- the same shape the store installer writes, with the
+    install directory as ~/aeon/games/<SKU> so it is right whatever the console's home directory is."""
+    line = f"cd ~/aeon/games/{sku}"
+    wd = m.get("workdir", ".")
+    if wd and wd != ".": line += f" && cd {shq(wd)}"
+    line += " && " + "".join(f"{k}={shq(v)} " for k, v in (m.get("env") or {}).items())
+    rt = m.get("runtime") or {}
+    if rt.get("type") == "proton":
+        pv = rt.get("version") or "default"
+        line += f"GAMEID='umu-{sku}' " + ("" if pv == "default" else f"PROTONPATH={shq(pv)} ") + "umu-run "
+    line += "./" + m["exec"] + "".join(" " + shq(a) for a in (m.get("args") or []))
+    return line
+
+def install(game_dir, host, clean):
+    """Sideload: tar the build over SSH into ~/aeon/games/<SKU>/, write the console's manifest.json, and ask a
+    dev-mode shell to rescan. Needs only ssh and tar on both ends."""
+    m = load_manifest(game_dir); validate(game_dir, m)
+    sku, ver = m["sku"], m["version"]
+    remote = f"aeon/games/{sku}"
+    def ssh(cmd, **kw): return subprocess.run(["ssh", host, cmd], **kw)
+    pre = f"mkdir -p {remote} .cache/aeon .config/aeon" + (f" && find {remote} -mindepth 1 -delete" if clean else "")
+    if ssh(pre).returncode != 0: die(f"cannot reach {host} (ssh must work without a password prompt, or answer it above)")
+    files = file_list(game_dir)
+    total = sum(e["size"] for e in files)
+    print(f"[install] {sku} {ver}: {len(files)} files, {total // (1 << 20)} MB -> {host}:~/{remote}/")
+    tar = subprocess.Popen(["tar", "-C", game_dir, "-cz", "--exclude=.git", "."], stdout=subprocess.PIPE)
+    untar = subprocess.run(["ssh", host, f"tar -C {remote} -xzf -"], stdin=tar.stdout)
+    tar.stdout.close(); tar.wait()
+    if tar.returncode != 0 or untar.returncode != 0: die("copy failed")
+    lm = {"id": sku, "title": m["title"], "version": ver, "exec": exec_line(m, sku), "platform": m.get("platform", ""),
+          "runtime": (m.get("runtime") or {}).get("type", "native"), "aeon_manifest": 2, "developer": m.get("developer", ""),
+          "saves": m.get("saves", []), "files": files, "sideloaded": int(time.time())}
+    r = ssh(f"cat > {remote}/manifest.json", input=json.dumps(lm, indent=2).encode())
+    if r.returncode != 0: die("could not write manifest.json")
+    ssh("touch .cache/aeon/rescan")
+    dev = ssh("test -f .config/aeon/devmode", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    print(f"[install] launch line: {lm['exec']}")
+    if dev: print(f"[install] done -- the console's shell picks it up within a second; it is in the Vault as '{m['title']}'. Logs: ~/.cache/aeon/logs/, frame times (with ~/.config/aeon/perf-overlay): ~/.cache/aeon/perf/")
+    else: print(f"[install] done -- that console is not in developer mode (no ~/.config/aeon/devmode), so restart its shell to see '{m['title']}' in the Vault; with dev mode on it would have appeared by itself, with logs and crash dumps kept")
+
 def main():
     ap = argparse.ArgumentParser(prog="aeon-pack", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -248,6 +293,7 @@ def main():
     a = sp.add_parser("validate"); a.add_argument("game_dir")
     a = sp.add_parser("build"); a.add_argument("game_dir"); a.add_argument("--out", default="./aeon-out")
     a = sp.add_parser("publish"); a.add_argument("pkg_dir"); a.add_argument("--local", action="store_true"); a.add_argument("--r2", action="store_true")
+    a = sp.add_parser("install"); a.add_argument("game_dir"); a.add_argument("host", help="user@console, anything ssh accepts"); a.add_argument("--clean", action="store_true", help="empty the install directory first")
     args = ap.parse_args()
     if args.cmd == "init":
         p = os.path.join(args.game_dir, "aeon.json")
@@ -259,5 +305,6 @@ def main():
     elif args.cmd == "publish":
         if not (args.local or args.r2): die("publish needs --local (dev server) and/or --r2 (Aeon)")
         publish(args.pkg_dir, args.local, args.r2)
+    elif args.cmd == "install": install(args.game_dir, args.host, args.clean)
 
 if __name__ == "__main__": main()

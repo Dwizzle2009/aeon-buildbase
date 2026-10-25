@@ -52,9 +52,15 @@ payload names and hashes per `content` entry, and `built`. Studios never write t
 aeon-pack init     ./build            # once: template aeon.json
 aeon-pack validate ./build            # every time: plain-English errors
 aeon-pack build    ./build --out ./out
+aeon-pack install  ./build wiz@console   # a development console: in its Vault a second later
 # hand ./out/<SKU>/ to Aeon
 aeon-pack publish  ./out/<SKU> --r2   # Aeon: sign + upload + register
 ```
+
+`install` needs only `ssh` and `tar` on both ends. It copies the build to `~/aeon/games/<SKU>/` on the console,
+writes the `manifest.json` the console's launcher reads (the same file a store install produces, with the launch
+line composed from `exec`, `args`, `env`, `workdir` and `runtime`) and asks a developer-mode shell to rescan;
+`--clean` empties the directory first.
 
 ## What the console does with it
 
