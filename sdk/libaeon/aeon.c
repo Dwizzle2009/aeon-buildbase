@@ -1,4 +1,7 @@
-/* libaeon -- see aeon.h. HTTP via libcurl; JSON via cJSON; one worker thread; callbacks on aeon_tick(). */
+/* libaeon -- see aeon.h. HTTP via libcurl; JSON via cJSON; one worker thread; callbacks on aeon_tick().
+ * 1.1: console events come from a small JSON file the shell rewrites (AEON_STATE) -- polled with stat() at
+ * most ten times a second from aeon_tick(), so they need no socket, no signal and no thread of their own,
+ * and the same mechanism works for a GDScript or C# port that cannot open a Unix socket. */
 #define _GNU_SOURCE
 #include "aeon.h"
 #include "third_party/cJSON/cJSON.h"
@@ -15,7 +18,15 @@
 static int g_on = 0, g_inited = 0;
 static char g_api[512], g_token[4096], g_sku[128], g_queue_path[1024];
 static AeonPlayer g_player;
+static AeonDisplay g_display;
 static char g_owned[32][128]; static int g_owned_n = 0;
+/* 1.1: console events (see the file comment) */
+static char g_state_path[1024];
+static int  g_guide = 0, g_resumes = 0, g_state_seen = 0;
+static struct timespec g_state_last_poll;
+static struct stat g_state_st;
+static AeonEventCallback g_ev_cb = NULL; static void* g_ev_user = NULL;
+static AeonEvent g_ev_ring[32]; static int g_ev_head = 0, g_ev_count = 0;   /* game-thread only */
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t g_worker; static int g_stop = 0;
@@ -168,18 +179,60 @@ static void* worker_main(void* ud) {
 static void enqueue(Job* j) { if (!g_on) { if (j->kind == J_LB_GET) { Done* d = calloc(1, sizeof *d); d->kind = J_LB_GET; d->lb_cb = j->lb_cb; d->user = j->user; d->lb = calloc(1, sizeof *d->lb); push_done(d); } else if (j->kind == J_PURCHASE) { Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; snprintf(d->sku, sizeof d->sku, "%s", j->a); push_done(d); } free(j); return; }
     pthread_mutex_lock(&g_mx); j->next = g_jobs; g_jobs = j; if (j->durable) queue_write_all(); pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mx); }
 
+/* ---------------- 1.1: console events ---------------- */
+static void ev_emit(int kind) {
+    AeonEvent ev; memset(&ev, 0, sizeof ev); ev.kind = kind;
+    if (g_ev_cb) { g_ev_cb(&ev, g_ev_user); return; }
+    if (g_ev_count == 32) { g_ev_head = (g_ev_head + 1) % 32; g_ev_count--; }   /* nobody is polling: keep the newest */
+    g_ev_ring[(g_ev_head + g_ev_count) % 32] = ev; g_ev_count++;
+}
+/* Reads AEON_STATE when it changed (the shell renames a new file over it, so the inode or mtime moves) and turns the
+ * differences into events. emit=0 at init records the baseline without reporting anything. */
+static void state_poll(int emit) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (emit) { long ms = (now.tv_sec - g_state_last_poll.tv_sec) * 1000L + (now.tv_nsec - g_state_last_poll.tv_nsec) / 1000000L; if (ms >= 0 && ms < 100) return; }
+    g_state_last_poll = now;
+    struct stat st; if (stat(g_state_path, &st) != 0) return;
+    if (g_state_seen && st.st_ino == g_state_st.st_ino && st.st_size == g_state_st.st_size && st.st_mtim.tv_sec == g_state_st.st_mtim.tv_sec && st.st_mtim.tv_nsec == g_state_st.st_mtim.tv_nsec) return;
+    g_state_st = st; g_state_seen = 1;
+    FILE* f = fopen(g_state_path, "r"); if (!f) return;
+    char buf[2048]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+    cJSON* j = cJSON_Parse(buf); if (!j) return;
+    int guide = cJSON_IsTrue(cJSON_GetObjectItem(j, "guide"));
+    cJSON* rs = cJSON_GetObjectItem(j, "resumes"); int resumes = rs ? (int)cJSON_GetNumberValue(rs) : g_resumes;
+    cJSON_Delete(j);
+    if (emit) {
+        if (resumes != g_resumes) { ev_emit(AEON_EV_SUSPEND); ev_emit(AEON_EV_RESUME); }
+        if (guide != g_guide) ev_emit(guide ? AEON_EV_GUIDE_OPENED : AEON_EV_GUIDE_CLOSED);
+    }
+    g_guide = guide; g_resumes = resumes;
+}
+void aeon_set_event_callback(AeonEventCallback cb, void* user) { g_ev_cb = cb; g_ev_user = user; if (cb) { while (g_ev_count) { AeonEvent ev = g_ev_ring[g_ev_head]; g_ev_head = (g_ev_head + 1) % 32; g_ev_count--; cb(&ev, user); } } }
+int  aeon_poll_event(AeonEvent* out) { if (!out || !g_ev_count) return 0; *out = g_ev_ring[g_ev_head]; g_ev_head = (g_ev_head + 1) % 32; g_ev_count--; return 1; }
+int  aeon_guide_open(void) { return g_on ? g_guide : 0; }
+const AeonDisplay* aeon_display(void) { return &g_display; }
+
 /* ---------------- public ---------------- */
 const char* aeon_sdk_version(void) { return AEON_SDK_VERSION; }
 const AeonPlayer* aeon_player(void) { return &g_player; }
 
 int aeon_init(void) {
     if (g_inited) return g_on;
-    g_inited = 1; memset(&g_player, 0, sizeof g_player); snprintf(g_player.gamertag, sizeof g_player.gamertag, "Player"); snprintf(g_player.lang, sizeof g_player.lang, "en");
+    g_inited = 1; memset(&g_player, 0, sizeof g_player); memset(&g_display, 0, sizeof g_display);
+    snprintf(g_player.gamertag, sizeof g_player.gamertag, "Player"); snprintf(g_player.lang, sizeof g_player.lang, "en");
+    snprintf(g_player.avatar_color, sizeof g_player.avatar_color, "#6366f1"); snprintf(g_player.banner_color, sizeof g_player.banner_color, "#0ea5e9");
     const char* on = getenv("AEON_SDK"), *api = getenv("AEON_API_URL"), *tok = getenv("AEON_SESSION"), *sku = getenv("AEON_SKU");
     if (!on || strcmp(on, "1") != 0 || !api || !tok || !sku) { g_on = 0; return 0; }
     snprintf(g_api, sizeof g_api, "%s", api); snprintf(g_token, sizeof g_token, "%s", tok); snprintf(g_sku, sizeof g_sku, "%s", sku);
-    const char* lang = getenv("AEON_LANG"); if (lang) snprintf(g_player.lang, sizeof g_player.lang, "%s", lang);
+    const char* lang = getenv("AEON_LANG"); if (lang && *lang) snprintf(g_player.lang, sizeof g_player.lang, "%s", lang);
     const char* pid = getenv("AEON_PLAYER_ID"); if (pid) snprintf(g_player.id, sizeof g_player.id, "%s", pid);
+    { /* 1.1: display facts and the event file, both from the launch environment */
+        const char* hz = getenv("AEON_REFRESH_HZ"), *vrr = getenv("AEON_VRR"), *outp = getenv("AEON_OUTPUT"), *st_ = getenv("AEON_STATE");
+        if (hz) g_display.refresh_hz = (int)(atof(hz) + 0.5);
+        g_display.vrr = vrr && strcmp(vrr, "1") == 0;
+        if (outp) snprintf(g_display.output, sizeof g_display.output, "%s", outp);
+        if (st_ && *st_) { snprintf(g_state_path, sizeof g_state_path, "%s", st_); state_poll(0); }   /* baseline, no events */
+    }
     if (!curl_load()) { g_on = 0; return 0; }
     p_global_init(CURL_GLOBAL_DEFAULT);
     const char* st = getenv("XDG_STATE_HOME"); const char* home = getenv("HOME"); char dir[900];
@@ -190,6 +243,10 @@ int aeon_init(void) {
     Buf out = {0}; if (http("GET", "/sdk/me", NULL, &out) == 200 && out.data) { cJSON* r = cJSON_Parse(out.data); if (r) {
         const char* g = cJSON_GetStringValue(cJSON_GetObjectItem(r, "gamertag")); if (g) snprintf(g_player.gamertag, sizeof g_player.gamertag, "%s", g);
         const char* id = cJSON_GetStringValue(cJSON_GetObjectItem(r, "player_id")); if (id) snprintf(g_player.id, sizeof g_player.id, "%s", id);
+        const char* ac = cJSON_GetStringValue(cJSON_GetObjectItem(r, "avatar_color")); if (ac && ac[0] == '#' && strlen(ac) == 7) snprintf(g_player.avatar_color, sizeof g_player.avatar_color, "%s", ac);
+        const char* bc = cJSON_GetStringValue(cJSON_GetObjectItem(r, "banner_color")); if (bc && bc[0] == '#' && strlen(bc) == 7) snprintf(g_player.banner_color, sizeof g_player.banner_color, "%s", bc);
+        const char* au = cJSON_GetStringValue(cJSON_GetObjectItem(r, "avatar_url")); if (au) snprintf(g_player.avatar_url, sizeof g_player.avatar_url, "%s", au);
+        g_player.sandbox = cJSON_IsTrue(cJSON_GetObjectItem(r, "sandbox"));
         cJSON_Delete(r); } } free(out.data);
     Buf o2 = {0}; if (http("GET", "/sdk/entitlements", NULL, &o2) == 200 && o2.data) { cJSON* r = cJSON_Parse(o2.data); if (r) { cJSON* e; cJSON_ArrayForEach(e, cJSON_GetObjectItem(r, "owned")) { if (g_owned_n < 32 && cJSON_IsString(e)) snprintf(g_owned[g_owned_n++], 128, "%s", e->valuestring); } cJSON_Delete(r); } } free(o2.data);
     g_player.on_aeon = 1;
@@ -198,6 +255,7 @@ int aeon_init(void) {
     return 1;
 }
 void aeon_tick(void) {
+    if (g_state_path[0]) state_poll(1);   /* 1.1 */
     Done* list; pthread_mutex_lock(&g_mx); list = g_done; g_done = NULL; pthread_mutex_unlock(&g_mx);
     while (list) { Done* d = list; list = d->next;
         if (d->kind == J_LB_GET && d->lb_cb) d->lb_cb(d->lb, d->user);

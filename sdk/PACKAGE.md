@@ -39,7 +39,7 @@ payload's sha256 against the signed manifest before extracting it.
 | `runtime` | yes | `{type: "native"}` for Linux builds; `{type: "proton", version: "default" \| "<Proton build>"}` for Windows builds. Aeon pins the default Proton in the OS; name a build only if your game needs a specific one. |
 | `exec` | yes | Launch target, relative to `workdir`. Native: an executable file. Proton: usually an `.exe`. |
 | `args`, `env`, `workdir` | no | Launch arguments, environment, working directory (relative). |
-| `saves` | recommended | Directories the game writes saves to. `~` is the player's home; for Proton, `{prefix}` is the Wine prefix root. These sync to the player's cloud saves. |
+| `saves` | recommended | Directories the game writes saves to. `~` is the player's home; for Proton, `{prefix}` is the Wine prefix root. These sync to the player's cloud saves (see below). |
 | `requires.disk_mb` | no | Installed size estimate shown before download. |
 | `content` | no | First entry must be `base`. Further entries are DLC packs: `dir` inside the build, `sku` for the entitlement that unlocks it. Each pack is a separate payload. |
 
@@ -71,6 +71,27 @@ line composed from `exec`, `args`, `env`, `workdir` and `runtime`) and asks a de
 - Composes the launch line from `workdir`, `env`, `runtime`, `exec`, `args`. Proton builds run through
   `umu-run` with `GAMEID=umu-<SKU>` (and `PROTONPATH` when a build is named).
 - Keeps `saves` and `files` in the local manifest for cloud-save sync and verify/repair.
+
+## Save directories
+
+The console syncs every directory in `saves` with the player's cloud copy: pulled before launch when another
+console pushed since, pushed after exit when anything changed, and the player is asked when both sides moved.
+No SDK call is involved; the directories are the whole contract, so get them right:
+
+- Entries start with `~/` (the player's home) or, for a Proton title, `{prefix}/` (the Wine prefix root, so a
+  Windows save path becomes `{prefix}/drive_c/users/steamuser/AppData/LocalLow/<Studio>/<Game>`). Nothing
+  outside the home, nothing under `~/aeon/` (the install area is replaced whole on update), no `..`.
+  `aeon-pack validate` refuses what the console would ignore.
+- Declare the directory your engine actually writes to on Linux, which is rarely the one it uses on Windows:
+  Godot's `user://` is `~/.local/share/godot/app_userdata/<project name>/` by default, or
+  `~/.local/share/<custom_user_dir_name>/` with `application/config/use_custom_user_dir` on; a packaged
+  Unreal game normally writes `SaveGames` under `~/.config/Epic/<ProjectName>/Saved/`; SDL and most C/C++
+  games use `~/.local/share/<game>/`. Run your build once and look before you commit the path.
+- Keep it to saves and profiles. Settings tied to one machine (resolution, key bindings, the last input
+  device) belong in another directory, or they follow the player to a console where they are wrong.
+- Write saves atomically (temp file, rename) and finish before you exit: the push starts when the process
+  ends. Keep the set small -- the console packs it on every exit that changed something, and stops syncing a
+  title over 512 MB on disk or 200 MB compressed.
 
 ## Rules of thumb
 

@@ -136,6 +136,13 @@ def validate(game_dir, m, strict=True):
     saves = m.get("saves", [])
     if not isinstance(saves, list) or not all(isinstance(s_, str) for s_ in saves): errs.append("'saves' must be a list of paths")
     elif not saves: warns.append("'saves' is empty -- cloud saves will not sync this title")
+    else:   # 1.2: the console applies the same rules and silently drops what fails them, so hear it here
+        for sv in saves:
+            if not (sv.startswith("~/") or sv.startswith("{prefix}/")): errs.append(f"'saves' entry must start with ~/ or {{prefix}}/: {sv}")
+            elif "/../" in sv or sv.endswith("/..") or sv.rstrip("/") in ("~", "{prefix}"): errs.append(f"'saves' entry must be a directory inside the home or prefix, not the root of it: {sv}")
+            elif sv.startswith("{prefix}/") and rtt != "proton": errs.append(f"'saves' uses {{prefix}} but runtime is {rtt}: {sv}")
+            elif sv.startswith("~/aeon/"): errs.append(f"'saves' entry is inside the install area, which is replaced whole on update: {sv}")
+            elif sv.startswith("{prefix}/") and not sv.startswith("{prefix}/drive_c/"): warns.append(f"'saves' entry under the prefix is usually below drive_c/: {sv}")
     content = m.get("content", [{"id": "base"}])
     if not isinstance(content, list) or not content: errs.append("'content' must be a non-empty list")
     else:
