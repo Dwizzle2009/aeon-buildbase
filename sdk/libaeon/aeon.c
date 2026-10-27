@@ -19,7 +19,7 @@ static int g_on = 0, g_inited = 0;
 static char g_api[512], g_token[4096], g_sku[128], g_queue_path[1024];
 static AeonPlayer g_player;
 static AeonDisplay g_display;
-static char g_owned[32][128]; static int g_owned_n = 0;
+static char g_owned[32][128]; static int g_owned_n = 0; static pthread_mutex_t g_owned_mx = PTHREAD_MUTEX_INITIALIZER;
 /* 1.1: console events (see the file comment) */
 static char g_state_path[1024];
 static int  g_guide = 0, g_resumes = 0, g_state_seen = 0;
@@ -31,7 +31,7 @@ static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t g_worker; static int g_stop = 0;
 
-typedef enum { J_UNLOCK, J_PROGRESS, J_SUBMIT, J_PRESENCE, J_EVENT, J_LB_GET, J_PURCHASE, J_PURCHASE_POLL } JobKind;
+typedef enum { J_UNLOCK, J_PROGRESS, J_SUBMIT, J_PRESENCE, J_EVENT, J_LB_GET, J_PURCHASE, J_PURCHASE_POLL, J_ENTITLEMENTS } JobKind;
 typedef struct Job {
     JobKind kind; int durable;          /* durable jobs survive offline (queued to disk) */
     char a[160]; char b[4096]; int n; int friends; int64_t score;
@@ -111,6 +111,14 @@ static void queue_load(void) {
     if (n) fprintf(stderr, "[aeon] %d queued report(s) from a previous session\n", n);
 }
 
+/* ---------------- entitlements ---------------- */
+static void entitlements_fetch(void) {
+    Buf o2 = {0}; if (http("GET", "/sdk/entitlements", NULL, &o2) == 200 && o2.data) { cJSON* r = cJSON_Parse(o2.data); if (r) {
+        pthread_mutex_lock(&g_owned_mx); g_owned_n = 0;
+        cJSON* e; cJSON_ArrayForEach(e, cJSON_GetObjectItem(r, "owned")) { if (g_owned_n < 32 && cJSON_IsString(e)) snprintf(g_owned[g_owned_n++], 128, "%s", e->valuestring); }
+        pthread_mutex_unlock(&g_owned_mx); cJSON_Delete(r); } } free(o2.data);
+}
+
 /* ---------------- worker ---------------- */
 static void push_done(Done* d) { d->next = NULL; pthread_mutex_lock(&g_mx); Done** p = &g_done; while (*p) p = &(*p)->next; *p = d; pthread_mutex_unlock(&g_mx); }
 static void json_escape(const char* s, char* out, size_t n) { size_t o = 0; for (; *s && o + 2 < n; s++) { if (*s == '"' || *s == '\\') out[o++] = '\\'; out[o++] = *s; } out[o] = 0; }
@@ -138,17 +146,18 @@ static int run_job(Job* j) {
     case J_PURCHASE: {
         json_escape(j->a, esc, sizeof esc); snprintf(body, sizeof body, "{\"sku\":\"%s\"}", esc); code = http("POST", "/sdk/purchase", body, &out);
         if (code == 200 && out.data) { cJSON* r = cJSON_Parse(out.data); const char* st = r ? cJSON_GetStringValue(cJSON_GetObjectItem(r, "status")) : NULL; const char* id = r ? cJSON_GetStringValue(cJSON_GetObjectItem(r, "id")) : NULL;
-            if (st && strcmp(st, "completed") == 0) { Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; d->completed = 1; snprintf(d->sku, sizeof d->sku, "%s", j->a); push_done(d); }
+            if (st && strcmp(st, "completed") == 0) { entitlements_fetch(); Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; d->completed = 1; snprintf(d->sku, sizeof d->sku, "%s", j->a); push_done(d); }
             else if (id) { Job* p = calloc(1, sizeof *p); p->kind = J_PURCHASE_POLL; snprintf(p->a, sizeof p->a, "%s", id); snprintf(p->b, sizeof p->b, "%s", j->a); p->p_cb = j->p_cb; p->user = j->user; p->next_at = time(NULL) + 2;
                 pthread_mutex_lock(&g_mx); p->next = g_jobs; g_jobs = p; pthread_mutex_unlock(&g_mx); }
             if (r) cJSON_Delete(r); }
         else { Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; d->completed = 0; snprintf(d->sku, sizeof d->sku, "%s", j->a); push_done(d); }
         free(out.data); return 1; }
+    case J_ENTITLEMENTS: entitlements_fetch(); free(out.data); return 1;   /* 1.1.1: a refresh on request (a completed purchase fetches inline; this is for callers that add one later) */
     case J_PURCHASE_POLL: {
         snprintf(path, sizeof path, "/sdk/purchase/%s", j->a); code = http("GET", path, NULL, &out);
         const char* st = NULL; cJSON* r = (code == 200 && out.data) ? cJSON_Parse(out.data) : NULL; if (r) st = cJSON_GetStringValue(cJSON_GetObjectItem(r, "status"));
         int finished = st && strcmp(st, "pending") != 0;
-        if (finished || j->tries > 300) { Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; d->completed = st && strcmp(st, "completed") == 0; snprintf(d->sku, sizeof d->sku, "%s", j->b); push_done(d); if (r) cJSON_Delete(r); free(out.data); return 1; }
+        if (finished || j->tries > 300) { int ok = st && strcmp(st, "completed") == 0; if (ok) entitlements_fetch(); Done* d = calloc(1, sizeof *d); d->kind = J_PURCHASE; d->p_cb = j->p_cb; d->user = j->user; d->completed = ok; snprintf(d->sku, sizeof d->sku, "%s", j->b); push_done(d); if (r) cJSON_Delete(r); free(out.data); return 1; }
         if (r) cJSON_Delete(r); free(out.data); j->tries++; j->next_at = time(NULL) + 2; return 0; }
     }
     free(out.data);
@@ -248,7 +257,7 @@ int aeon_init(void) {
         const char* au = cJSON_GetStringValue(cJSON_GetObjectItem(r, "avatar_url")); if (au) snprintf(g_player.avatar_url, sizeof g_player.avatar_url, "%s", au);
         g_player.sandbox = cJSON_IsTrue(cJSON_GetObjectItem(r, "sandbox"));
         cJSON_Delete(r); } } free(out.data);
-    Buf o2 = {0}; if (http("GET", "/sdk/entitlements", NULL, &o2) == 200 && o2.data) { cJSON* r = cJSON_Parse(o2.data); if (r) { cJSON* e; cJSON_ArrayForEach(e, cJSON_GetObjectItem(r, "owned")) { if (g_owned_n < 32 && cJSON_IsString(e)) snprintf(g_owned[g_owned_n++], 128, "%s", e->valuestring); } cJSON_Delete(r); } } free(o2.data);
+    entitlements_fetch();
     g_player.on_aeon = 1;
     queue_load();
     pthread_create(&g_worker, NULL, worker_main, NULL);
@@ -271,7 +280,7 @@ void aeon_achievement_unlock(const char* id) { if (!id) return; Job* j = calloc(
 void aeon_achievement_progress(const char* id, int value, int max) { if (!id) return; Job* j = calloc(1, sizeof *j); j->kind = J_PROGRESS; j->durable = 1; snprintf(j->a, sizeof j->a, "%s", id); j->n = value; j->score = max; enqueue(j); }
 void aeon_leaderboard_submit(const char* category, int64_t score, const char* meta) { if (!category) return; Job* j = calloc(1, sizeof *j); j->kind = J_SUBMIT; j->durable = 1; snprintf(j->a, sizeof j->a, "%s", category); j->score = score; if (meta) snprintf(j->b, sizeof j->b, "%s", meta); enqueue(j); }
 void aeon_leaderboard_get(const char* category, int n, int friends, AeonLbCallback cb, void* user) { if (!category) return; Job* j = calloc(1, sizeof *j); j->kind = J_LB_GET; snprintf(j->a, sizeof j->a, "%s", category); j->n = n; j->friends = friends; j->lb_cb = cb; j->user = user; enqueue(j); }
-int  aeon_owns(const char* sku) { if (!sku) return 0; if (!g_on) return 1; /* off-Aeon: everything is owned, so a dev build shows all content */ for (int i = 0; i < g_owned_n; i++) if (strcmp(g_owned[i], sku) == 0) return 1; return 0; }
+int  aeon_owns(const char* sku) { if (!sku) return 0; if (!g_on) return 1; /* off-Aeon: everything is owned, so a dev build shows all content */ int r = 0; pthread_mutex_lock(&g_owned_mx); for (int i = 0; i < g_owned_n; i++) if (strcmp(g_owned[i], sku) == 0) { r = 1; break; } pthread_mutex_unlock(&g_owned_mx); return r; }
 void aeon_presence(const char* status) { if (!status) return; Job* j = calloc(1, sizeof *j); j->kind = J_PRESENCE; snprintf(j->a, sizeof j->a, "%s", status); enqueue(j); }
 void aeon_purchase(const char* sku, AeonPurchaseCallback cb, void* user) { if (!sku) return; Job* j = calloc(1, sizeof *j); j->kind = J_PURCHASE; snprintf(j->a, sizeof j->a, "%s", sku); j->p_cb = cb; j->user = user; enqueue(j); }
 void aeon_event(const char* name, const char* payload) { if (!name) return; Job* j = calloc(1, sizeof *j); j->kind = J_EVENT; j->durable = 1; snprintf(j->a, sizeof j->a, "%s", name); if (payload) snprintf(j->b, sizeof j->b, "%s", payload); enqueue(j); }

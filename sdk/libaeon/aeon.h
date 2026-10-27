@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define AEON_SDK_VERSION "1.1.0"
+#define AEON_SDK_VERSION "1.1.1"
 
 typedef struct AeonPlayer {
     char id[64];
