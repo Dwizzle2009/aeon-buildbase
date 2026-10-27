@@ -85,8 +85,9 @@ No SDK call is involved; the directories are the whole contract, so get them rig
 - Declare the directory your engine actually writes to on Linux, which is rarely the one it uses on Windows:
   Godot's `user://` is `~/.local/share/godot/app_userdata/<project name>/` by default, or
   `~/.local/share/<custom_user_dir_name>/` with `application/config/use_custom_user_dir` on; a packaged
-  Unreal game normally writes `SaveGames` under `~/.config/Epic/<ProjectName>/Saved/`; SDL and most C/C++
-  games use `~/.local/share/<game>/`. Run your build once and look before you commit the path.
+  Unreal game normally writes `SaveGames` under `~/.config/Epic/<ProjectName>/Saved/`; Unity's
+  `Application.persistentDataPath` is `~/.config/unity3d/<Company>/<Product>/`; SDL and most C/C++ games use
+  `~/.local/share/<game>/`. Run your build once and look before you commit the path.
 - Keep it to saves and profiles. Settings tied to one machine (resolution, key bindings, the last input
   device) belong in another directory, or they follow the player to a console where they are wrong.
 - Write saves atomically (temp file, rename) and finish before you exit: the push starts when the process
