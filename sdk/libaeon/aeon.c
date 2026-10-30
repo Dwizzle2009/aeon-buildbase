@@ -240,6 +240,7 @@ int aeon_init(void) {
         if (hz) g_display.refresh_hz = (int)(atof(hz) + 0.5);
         g_display.vrr = vrr && strcmp(vrr, "1") == 0;
         if (outp) snprintf(g_display.output, sizeof g_display.output, "%s", outp);
+        { const char* pr = getenv("AEON_PREFER"); g_display.prefer = pr ? (strcmp(pr, "performance") == 0 ? 1 : (strcmp(pr, "quality") == 0 ? 2 : 0)) : 0; }   /* 1.2 */
         if (st_ && *st_) { snprintf(g_state_path, sizeof g_state_path, "%s", st_); state_poll(0); }   /* baseline, no events */
     }
     if (!curl_load()) { g_on = 0; return 0; }

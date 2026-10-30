@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define AEON_SDK_VERSION "1.1.1"
+#define AEON_SDK_VERSION "1.2.0"
 
 typedef struct AeonPlayer {
     char id[64];
@@ -56,6 +56,9 @@ typedef struct AeonDisplay {
     int  refresh_hz;      /* the output's refresh rate, rounded (60, 120, 144); 0 off-Aeon */
     int  vrr;             /* 1 when variable refresh is live, so an uncapped frame rate stays smooth */
     char output[32];      /* the output mode, "2560x1440"; "" off-Aeon */
+    int  prefer;          /* 1.2: the player's Settings > Performance > Game preset: 0 game decides, 1 prefer performance
+                             (frame rate first: lower resolution / effects for 120 or a steady 60), 2 prefer quality (resolution and
+                             effects first; 30 or 60 is fine). A hint -- honour it as the default of your own graphics menu. */
 } AeonDisplay;
 
 int         aeon_init(void);                     /* 1 on Aeon, 0 off-Aeon (calls become no-ops), -1 on error */
