@@ -7,7 +7,7 @@
  * background; anything that fails for lack of a network is kept on disk and retried, including
  * on the next launch. Nothing here blocks the calling thread except aeon_init() (bounded, ~2s).
  *
- * 1.1 adds the player's colours for in-game display, console events (the Guide opening and
+ * 1.1 adds the player's colors for in-game display, console events (the Guide opening and
  * closing, suspend and resume) and the display facts the console launched the game with.
  * The 1.0 ABI is kept: AeonPlayer only grew at the end, and every 1.0 symbol is unchanged.
  */
@@ -58,7 +58,7 @@ typedef struct AeonDisplay {
     char output[32];      /* the output mode, "2560x1440"; "" off-Aeon */
     int  prefer;          /* 1.2: the player's Settings > Performance > Game preset: 0 game decides, 1 prefer performance
                              (frame rate first: lower resolution / effects for 120 or a steady 60), 2 prefer quality (resolution and
-                             effects first; 30 or 60 is fine). A hint -- honour it as the default of your own graphics menu. */
+                             effects first; 30 or 60 is fine). A hint -- honor it as the default of your own graphics menu. */
 } AeonDisplay;
 
 int         aeon_init(void);                     /* 1 on Aeon, 0 off-Aeon (calls become no-ops), -1 on error */
